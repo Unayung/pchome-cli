@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+"""
+pchome - agent-native CLI for PChome 24h購物 (24h.pchome.com.tw, TWD). No checkout.
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+Endpoints, measured 2026-10-29 with real requests (plain HTTPS + browser UA
+works for all of them; none was bot-walled):
+
+  search   GET ecshweb.pchome.com.tw/search/v4.3/all/results
+             ?q=..&page=N&sort=rnk/dc|sale/dc|prc/ac|prc/dc|new/dc&price=MIN-MAX
+           -> {TotalRows, TotalPage, Prods:[{Id, Name, Describe, Price,
+               OriginPrice, ratingValue, reviewCount, isPChome, ...}]}  20/page
+  product  GET ecapi-cdn.pchome.com.tw/ecshop/prodapi/v2/prod/<ID>&fields=...
+             (or prod?id=A,B&fields=... for many). The path-style URLs
+             (prod/<ID>&.., prod/spec&id=.., /desc) answer an EMPTY 200 unless
+             `&_callback=<name>` is added (JSONP); the CLI always adds it -> {<ID>-000: {Name, Price:{M,P,Prime,Low}, Qty,
+             isSpec, Store, ShipType, isArrival24h, PreOrdDate, ...}}
+           GET .../prodapi/v2/prod/spec&id=<ID>   specs (尺寸/顏色) with ids
+             <ID>-003.. and stock Qty
+           GET .../prodapi/v2/prod/button&id=A,B&fields=Id,Price,Qty,ButtonType,
+             SaleStatus   price/stock/buyability per spec id (price check)
+           GET .../prodapi/v2/prod/<ID>/desc&fields=Slogan,...  promo blurb
+  member   GET ecapi.pchome.com.tw/member/v2/member/islogin   -> 1 / 0
+           GET ecapi.pchome.com.tw/member/v2/member  -> {LoginEmail (masked),
+             LoginMobile (masked), PCoin, CashPoint} or {Code:403}
+           GET ecapi.pchome.com.tw/member/v2/member/id -> "full@email" or null
+  cart     GET ecssl.pchome.com.tw/sys/cflow/fsapi/BigCar/BIGCAR/ItemList
+             -> itemlist.houses.<24H|ITEM_0_ALL..>.packages[].items{Key:{IT_SNO,
+                SR_NO, IT_NAME, QTY, PRICE, SPEC, StockQTY, ...}}, totalPrice
+           GET ecssl-cart.pchome.com.tw/sys/cflow/ecapi/prod/cart/v1/prod/<ID>/snapup
+             -> {MAC, MACExpire} (anti-bot token, ~15 min) needed by ADD
+           GET ecssl-cart.pchome.com.tw/cart/index.php/prod/modify?callback=..&data=
+             {"G":[],"A":[],"B":[],"C":[],"TB":"24H","TP":2,"T":"ADD",
+              "TI":"<ID>-000","RS":"<Store>","YTQ":qty,"CAX":MAC,"CAXE":MACExpire}
+             -> JSONP {PRODTOTAL, PRODCOUNT, ...}   (also the web app's add button)
+           POST ecssl.pchome.com.tw/sys/cflow/fsapi/BigCar/BIGCAR/modifyItem
+             form data={"T":"DEL","TI","RS","TTI":"A","KEY","LB":"Y"}   remove
+             form data={"T":"UPD","TI","YTQ","RS","TB":"24H","KEY","LB":"Y"} qty
+             -> empty 200; the CLI re-reads ItemList to confirm.
+  The cart is tied to the ECWEBSESS cookie (works for a guest too; a guest
+  cart is merged into the member cart on sign-in). Everything under
+  /sys/cflow other than the four calls above (checkout, orders, payment) is
+  never called.
+
+Login: PChome uses password + reCAPTCHA (+ OTP), so the CLI never handles
+credentials. `pchome login` (default --from-browser) reads the pchome cookies
+from the Edge/Chrome on CDP (PCHOME_CDP, default http://127.0.0.1:9222); if
+that browser is not signed in it opens the login page in a BACKGROUND tab and
+polls until you sign in there yourself (--wait, default 300 s), then closes
+only that tab. Also --from-clipboard / --cookie-stdin. The cookie is verified
+over plain HTTP (member/islogin + member/id) before it is saved to
+~/.config/pchome/state.json (0600) or the OS keyring (--keyring).
+PCHOME_COOKIE overrides both. Cart commands always use the SAVED session.
+
+Transport: HTTP first; on a 403/HTML challenge the same GET is retried with
+fetch() inside a background tab of the CDP browser (--via auto|http|browser).
+
+Unofficial. Undocumented, private API - it can break without warning.
+No checkout / payment / order placement, by design.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+CDP = os.environ.get("PCHOME_CDP", "http://127.0.0.1:9222")
+SITE = "https://24h.pchome.com.tw"
+SEARCH = "https://ecshweb.pchome.com.tw/search/v4.3/all/results"
+PROD = "https://ecapi-cdn.pchome.com.tw/ecshop/prodapi/v2"
+MEMBER = "https://ecapi.pchome.com.tw/member/v2/member"
+ECSSL = "https://ecssl.pchome.com.tw"
+CARTAPI = ECSSL + "/sys/cflow/fsapi/BigCar/BIGCAR"
+CARTJS = "https://ecssl-cart.pchome.com.tw"
+CART_PAGE = ECSSL + "/fsrwd/cart"
+LOGIN_URL = "https://ecvip.pchome.com.tw/login/v3/login.htm?rurl=" + urllib.parse.quote(SITE + "/", safe="")
+IMG = "https://img.pchome.com.tw/cs"
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+UA = os.environ.get("PCHOME_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+STATE_DIR = os.path.expanduser(os.environ.get("PCHOME_HOME", "~/.config/pchome"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "pchome-cli"
+PROD_FIELDS = ("Seq,Id,Name,Nick,Store,PreOrdDate,SpeOrdDate,Price,Discount,Pic,Qty,Bonus,"
+               "isSpec,isCombine,isDiy,isBigCart,isSnapUp,isPrimeOnly,isPreOrder24h,isFresh,"
+               "isSet,isArrival24h,ShipType,ShipDay,ShipTag,isETicket,isO2O,ButtonType,"
+               "SaleStatus,CateId")
+SORTS = {"relevance": "rnk/dc", "sales": "sale/dc", "price": "prc/ac", "price-desc": "prc/dc",
+         "new": "new/dc"}
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad(c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def nt(v):
+    return "" if v is None else f"${v:,}"
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _cdp_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). start Edge with --remote-debugging-port=9222")
+
+
+def browser_cookies():
+    """All *.pchome.com.tw cookies of the CDP browser (no tab needed)."""
+    b = WS(_cdp_json("/json/version")["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    return [c for c in cks if c.get("domain", "").endswith("pchome.com.tw")]
+
+
+def cookies_to_header(cks):
+    """Prefer the .pchome.com.tw copy when a name exists on several hosts."""
+    seen = {}
+    for c in sorted(cks, key=lambda c: c["domain"] != ".pchome.com.tw"):
+        seen.setdefault(c["name"], c["value"])
+    return "; ".join(f"{k}={v}" for k, v in seen.items())
+
+
+class Browser:
+    """One background tab, closed on exit. Never focused; user tabs untouched."""
+
+    def __init__(self, url=SITE + "/", debug=False):
+        self.debug = debug
+        self.b = WS(_cdp_json("/json/version")["webSocketDebuggerUrl"])
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _cdp_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+        except BaseException:
+            self.close()
+            raise
+
+    def wait_ready(self, origin=SITE, limit=25):
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            try:
+                r = self.eval("location.origin + '|' + document.readyState")
+            except ApiError:
+                r = None
+            if r and r.startswith(origin) and r.endswith(("interactive", "complete")):
+                return
+            time.sleep(0.5)
+        raise Net(f"{origin} did not load in the background tab")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def get(self, url):
+        """Top-level navigation of OUR tab to the URL (cross-origin fetch() is CORS-blocked:
+        the web app itself uses JSONP), then read the body text."""
+        self.p.call("Page.navigate", url=url)
+        t0 = time.time()
+        while time.time() - t0 < 25:
+            time.sleep(0.4)
+            try:
+                r = self.eval("location.href + '\\n' + document.readyState + '\\n' + "
+                              "document.contentType + '\\n' + (document.body ? "
+                              "document.body.innerText : '')")
+            except ApiError:
+                continue
+            href, state, ctype, body = (r.split("\n", 3) + ["", "", ""])[:4]
+            if href.startswith(url[:40]) and state == "complete":
+                return (200, body) if "html" not in ctype else (403, "<html>")
+        raise Net(f"browser did not load {url[:80]}")
+
+    def close(self):
+        try:
+            self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None):
+    acct = "default"
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=pchome-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    except (OSError, ValueError) as e:
+        raise ApiError(f"state file unreadable: {e}")
+    if os.environ.get("PCHOME_COOKIE"):
+        st["cookie"], st["source"] = clean_cookie(os.environ["PCHOME_COOKIE"]), "env"
+    elif st.get("cookie_in_keyring"):
+        st["cookie"], st["source"] = _keyring("get"), "keyring"
+    elif st.get("cookie"):
+        st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k != "source"}
+    if out.get("cookie_in_keyring"):
+        out.pop("cookie", None)
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+COOKIE_PAIR = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+=[\x21-\x7e]*$")
+
+
+def clean_cookie(raw):
+    """Keep only valid name=value pairs; refuse text that is not a PChome Cookie header."""
+    raw = (raw or "").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    pairs = [p.strip() for p in raw.replace("\n", ";").split(";")]
+    good = [p for p in pairs if p and COOKIE_PAIR.match(p)]
+    bad = [p for p in pairs if p and not COOKIE_PAIR.match(p)]
+    if not any(p.startswith("ECWEBSESS=") for p in good):
+        preview = raw[:40].encode("ascii", "replace").decode()
+        raise Auth("that does not look like a PChome Cookie header (no ECWEBSESS; starts with "
+                   f"{preview!r}). In DevTools > Network click a 24h.pchome.com.tw request > "
+                   "Request Headers and copy the value of `Cookie`")
+    if bad:
+        print(f"note: dropped {len(bad)} malformed cookie part(s)", file=sys.stderr)
+    return "; ".join(good)
+
+
+# -------------------------------------------------------------- transport
+def strip_jsonp(text):
+    t = text.strip()
+    m = re.match(r"^(?:try\{)?\s*[\w$.]+\((.*)\);?\s*(?:\}catch\(e\)\{.*\})?\s*$", t, re.S)
+    return m.group(1) if m else t
+
+
+class Http:
+    """Direct HTTPS with a browser UA (+ the saved cookie when there is one)."""
+
+    def __init__(self, cookie=None, debug=False):
+        self.cookie, self.debug = cookie, debug
+
+    def request(self, url, data=None, referer=SITE + "/", extra=None):
+        h = {"User-Agent": UA, "Referer": referer, "Accept": "application/json, text/plain, */*",
+             "Accept-Language": "zh-TW,zh;q=0.9"}
+        if self.cookie:
+            h["Cookie"] = self.cookie
+        body = None
+        if data is not None:
+            h["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+            h["Origin"] = ECSSL
+            body = urllib.parse.urlencode(data).encode()
+        h.update(extra or {})
+        if self.debug:
+            print(f"> {'POST' if body else 'GET'} {url}" + (f"  {data}" if data else ""), file=sys.stderr)
+        req = urllib.request.Request(url, data=body, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                code, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise Net(f"{urllib.parse.urlparse(url).netloc}: {e}")
+        if self.debug:
+            print(f"< {code} {text[:300]}", file=sys.stderr)
+        return code, text
+
+
+def parse_json(url, code, text):
+    host = urllib.parse.urlparse(url).netloc
+    if code in (403, 429) or text.lstrip()[:1] == "<":
+        raise Blocked(f"{host}: blocked or HTML reply (HTTP {code})")
+    if code >= 400:
+        raise ApiError(f"{host}: HTTP {code}", {"http": code, "url": url})
+    try:
+        return json.loads(strip_jsonp(text)) if text.strip() else None
+    except ValueError:
+        raise ApiError(f"{host}: non-JSON reply (HTTP {code})", {"head": text[:200]})
+
+
+class Client:
+    """HTTP first; on a bot wall retry that GET in a CDP background tab."""
+
+    def __init__(self, args, need_login=False):
+        self.args = args
+        self.st = load_state()
+        if need_login and not self.st.get("cookie"):
+            raise Auth("not signed in - run `pchome login` (sign in to PChome in Edge yourself)")
+        self.http = Http(self.st.get("cookie"), getattr(args, "debug", False))
+        self.br = None
+
+    def get(self, url, referer=SITE + "/"):
+        if url.startswith(PROD) and "_callback=" not in url:
+            # measured: prodapi path-style URLs (prod/<ID>&.., prod/spec&id=..) reply an
+            # EMPTY 200 unless a JSONP _callback is given; prod?id= answers either way
+            url += "&_callback=jsonp_cli"
+        via = getattr(self.args, "via", "auto")
+        if via != "browser":
+            try:
+                return parse_json(url, *self.http.request(url, referer=referer))
+            except Blocked:
+                if via == "http":
+                    raise
+                print(f"note: {urllib.parse.urlparse(url).netloc} blocked over HTTP, retrying via browser",
+                      file=sys.stderr)
+        if not self.br:
+            self.br = Browser("about:blank", debug=self.args.debug)
+        return parse_json(url, *self.br.get(url))
+
+    def post(self, url, data, referer=CART_PAGE):
+        # writes always go over HTTP with the SAVED session (never borrow the browser's)
+        code, text = self.http.request(url, data=data, referer=referer)
+        if code >= 400 or text.lstrip()[:1] == "<":
+            raise ApiError(f"POST {urllib.parse.urlparse(url).path}: HTTP {code}", {"head": text[:200]})
+        return text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        if self.br:
+            self.br.close()
+
+
+# --------------------------------------------------------------- products
+ID_RE = re.compile(r"([A-Z0-9]{6}-[A-Z0-9]{9})(?:-(\d{3}))?", re.I)
+
+
+def prod_id(ref):
+    """URL / DYAJ8C-A900GXXXX / DYAJ8C-A900GXXXX-000 -> (group id, spec suffix or None)."""
+    m = ID_RE.search(ref.strip())
+    if not m:
+        raise Usage(f"not a PChome product id or URL: {ref!r} (looks like DAAG8M-A900H3TL3)")
+    return m.group(1).upper(), m.group(2)
+
+
+def prod_url(pid):
+    return f"{SITE}/prod/{pid}"
+
+
+def shipping(p):
+    tags = []
+    if p.get("isArrival24h"):
+        tags.append("24h到貨")
+    st = p.get("ShipType")
+    if st == "Trans":
+        tags.append("廠商出貨")
+    elif st == "Consign":
+        tags.append("PChome倉出貨")
+    elif st:
+        tags.append(st)
+    if p.get("PreOrdDate"):
+        tags.append(f"預購 {p['PreOrdDate']}")
+    if p.get("ShipDay"):
+        tags.append(f"{p['ShipDay']}天出貨")
+    return " ".join(tags)
+
+
+def price_of(pr):
+    """Price object {M: list price (0 = none), P: selling, Prime, Low} -> (price, orig)."""
+    pr = pr or {}
+    p = pr.get("P")
+    m = pr.get("M") or None
+    return p, (m if m and p is not None and m > p else None)
+
+
+def discount(price, orig):
+    if price and orig and orig > price:
+        return f"{round(price * 100 / orig) / 10:g}折"
+    return ""
+
+
+def cmd_search(args):
+    if args.min is not None or args.max is not None:
+        rng = f"{args.min or 0}-{args.max or 9999999}"
+    else:
+        rng = None
+    out, page = [], args.page
+    with Client(args) as c:
+        while len(out) < args.limit:
+            q = {"q": args.query, "page": page, "sort": SORTS[args.sort]}
+            if rng:
+                q["price"] = rng
+            d = c.get(SEARCH + "?" + urllib.parse.urlencode(q)) or {}
+            prods = d.get("Prods") or []
+            for p in prods:
+                pr, orig = p.get("Price"), p.get("OriginPrice")
+                orig = orig if orig and pr and orig > pr else None
+                out.append({"id": p.get("Id"), "title": p.get("Name"), "price": pr, "orig_price": orig,
+                            "discount": discount(pr, orig), "rating": p.get("ratingValue"),
+                            "reviews": p.get("reviewCount"), "pchome_24h": bool(p.get("isPChome")),
+                            "describe": p.get("Describe"), "url": prod_url(p.get("Id")),
+                            "image": IMG + p["PicS"] if p.get("PicS") else None})
+            total, pages = d.get("TotalRows"), d.get("TotalPage") or 0
+            if not prods or page >= pages or len(out) >= args.limit:
+                break
+            page += 1
+            time.sleep(0.5)
+    out = out[: args.limit]
+    meta = {"query": args.query, "total": total, "pages": pages, "sort": args.sort, "results": out}
+
+    def human():
+        rows = [[i + 1, r["id"], clip(r["title"], 46), nt(r["price"]), nt(r["orig_price"]), r["discount"],
+                 f"{r['rating']}★({r['reviews']})" if r["reviews"] else ""] for i, r in enumerate(out)]
+        return f"{total} results for {args.query!r} (sort {args.sort})\n" + table(
+            rows, ["#", "id", "title", "price", "orig", "off", "rating"])
+    return emit(ok(meta), args.json, human)
+
+
+def fetch_product(c, pid):
+    d = c.get(f"{PROD}/prod/{pid}&fields={PROD_FIELDS}") or {}
+    if not d:
+        raise ApiError(f"no such product {pid}")
+    return d.get(pid + "-000") or next(iter(d.values()))
+
+
+def fetch_specs(c, pid, p):
+    """[{id, spec, qty, price, orig, buyable}] incl. -000 when the item has no specs."""
+    btn = c.get(f"{PROD}/prod/button&id={pid}&fields=Id,Price,Qty,ButtonType,SaleStatus") or []
+    bmap = {b["Id"]: b for b in btn}
+    specs = []
+    if p.get("isSpec"):
+        for s in (c.get(f"{PROD}/prod/spec&id={pid}") or {}).get(pid) or []:
+            b = bmap.get(s["Id"], {})
+            price, orig = price_of(b.get("Price"))
+            specs.append({"id": s["Id"], "spec": s.get("Spec"), "qty": b.get("Qty", s.get("Qty")),
+                          "price": price, "orig_price": orig, "button": b.get("ButtonType"),
+                          "buyable": b.get("ButtonType") == "ForSale" and (b.get("Qty", s.get("Qty")) or 0) > 0})
+    return specs, bmap.get(pid + "-000", {})
+
+
+def product_info(c, pid):
+    p = fetch_product(c, pid)
+    specs, main = fetch_specs(c, pid, p)
+    price, orig = price_of(p.get("Price"))
+    try:
+        desc = (c.get(f"{PROD}/prod/{pid}/desc&fields=Id,Slogan") or {}).get(pid) or {}
+    except ApiError:
+        desc = {}
+    slogan = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", desc.get("Slogan") or "")).strip()
+    pr = p.get("Price") or {}
+    btn = main.get("ButtonType") or p.get("ButtonType")
+    qty = main.get("Qty", p.get("Qty"))
+    in_stock = (any(s["buyable"] for s in specs) if specs
+                else btn == "ForSale" and (qty or 0) > 0)
+    return {"id": pid, "title": p.get("Name"), "price": price, "orig_price": orig,
+            "discount": discount(price, orig), "prime_price": pr.get("Prime") or None,
+            "promo": " ".join(x for x in (pr.get("DiscountText"), slogan) if x) or None,
+            "in_stock": in_stock, "max_qty": qty, "button": btn, "store": p.get("Store"),
+            "shipping": shipping(p), "pre_order": p.get("PreOrdDate") or None,
+            "has_specs": bool(p.get("isSpec")), "specs": specs, "url": prod_url(pid),
+            "image": IMG + (p.get("Pic") or {}).get("B") if (p.get("Pic") or {}).get("B") else None}
+
+
+def cmd_product(args):
+    pid, _ = prod_id(args.ref)
+    with Client(args) as c:
+        it = product_info(c, pid)
+
+    def human():
+        out = [it["title"], it["url"],
+               f"price {nt(it['price'])}" + (f"  (list {nt(it['orig_price'])}, {it['discount']})"
+                                              if it["orig_price"] else ""),
+               f"stock {'in stock' if it['in_stock'] else 'SOLD OUT / not for sale'}"
+               f"  (button {it['button']}, max {it['max_qty']})",
+               f"ship  {it['shipping'] or '-'}   store {it['store']}"]
+        if it["promo"]:
+            out.append(f"promo {clip(it['promo'], 100)}")
+        if it["specs"]:
+            out += ["", "specs (cart add --spec <spec text or id>):",
+                    table([[s["id"], s["spec"], nt(s["price"]), s["qty"],
+                            "" if s["buyable"] else "SOLD OUT"] for s in it["specs"]],
+                          ["id", "spec", "price", "qty", ""])]
+        return "\n".join(out)
+    return emit(ok(it), args.json, human)
+
+
+def cmd_price(args):
+    ids = []
+    for r in args.refs:
+        pid, _ = prod_id(r)
+        if pid not in ids:
+            ids.append(pid)
+    rows = []
+    with Client(args) as c:
+        for i in range(0, len(ids), 20):
+            chunk = ids[i:i + 20]
+            names = c.get(f"{PROD}/prod?id={','.join(chunk)}&fields=Id,Name") or {}
+            btn = c.get(f"{PROD}/prod/button&id={','.join(chunk)}&fields=Id,Price,Qty,ButtonType,SaleStatus") or []
+            bmap = {b["Id"]: b for b in btn}
+            for pid in chunk:
+                b = bmap.get(pid + "-000")
+                n = names.get(pid + "-000") or {}
+                if not b and not n:
+                    rows.append({"id": pid, "error": "not found"})
+                    continue
+                price, orig = price_of((b or {}).get("Price"))
+                rows.append({"id": pid, "title": n.get("Name"), "price": price, "orig_price": orig,
+                             "discount": discount(price, orig), "qty": (b or {}).get("Qty"),
+                             "in_stock": (b or {}).get("ButtonType") == "ForSale" and ((b or {}).get("Qty") or 0) > 0,
+                             "button": (b or {}).get("ButtonType"), "url": prod_url(pid),
+                             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    return emit(ok(rows), args.json, lambda: table(
+        [[r["id"], clip(r.get("title"), 40), nt(r.get("price")), nt(r.get("orig_price")),
+          "yes" if r.get("in_stock") else ("-" if r.get("error") else "NO")] for r in rows],
+        ["id", "title", "price", "orig", "stock"]))
+
+
+def cmd_raw(args):
+    u = args.url
+    if not u.startswith("http"):
+        u = PROD + "/" + u.lstrip("/")
+    host = urllib.parse.urlparse(u).netloc
+    allowed = ("ecshweb.pchome.com.tw", "ecapi-cdn.pchome.com.tw", "ecapi.pchome.com.tw",
+               "ecssl.pchome.com.tw", "24h.pchome.com.tw")
+    if host not in allowed or re.search(r"modify|checkout|order|pay|logout|setUse|snapup", u, re.I):
+        raise Usage(f"raw only GETs read endpoints on {', '.join(allowed)} (no cart writes / checkout)")
+    with Client(args) as c:
+        d = c.get(u)
+    return emit(ok(d), True)
+
+
+# ------------------------------------------------------------------- login
+def member_info(cookie, debug=False):
+    """Verify a cookie over plain HTTP. Returns member dict or raises Auth."""
+    h = Http(cookie, debug)
+    code, text = h.request(MEMBER + "/islogin")
+    if strip_jsonp(text).strip() != "1":
+        raise Auth("PChome says this session is not signed in (member/islogin = "
+                   f"{strip_jsonp(text).strip()[:20]!r}) - run `pchome login`")
+    m = parse_json(MEMBER, *h.request(MEMBER)) or {}
+    if m.get("Code") == 403:
+        raise Auth("PChome rejected the session (member: 403) - run `pchome login`")
+    email = parse_json(MEMBER, *h.request(MEMBER + "/id"))
+    return {"email": email, "login_email": m.get("LoginEmail"), "mobile": m.get("LoginMobile"),
+            "pcoin": m.get("PCoin"), "cash_point": m.get("CashPoint")}
+
+
+def _is_logged_in(cookie):
+    try:
+        _, t = Http(cookie).request(MEMBER + "/islogin")
+        return strip_jsonp(t).strip() == "1"
+    except Net:
+        return False
+
+
+def from_browser(args):
+    global CDP
+    if args.cdp:
+        CDP = args.cdp
+    cks = browser_cookies()
+    cookie = cookies_to_header(cks)
+    if "ECWEBSESS=" in cookie and _is_logged_in(cookie):
+        return cookie
+    if args.wait <= 0:
+        raise Auth(f"the browser on {CDP} is not signed in to PChome")
+    print(f"not signed in to PChome in the browser on {CDP}; opened the login page in a "
+          f"background tab - sign in there yourself (waiting up to {args.wait}s)...", file=sys.stderr)
+    br = Browser(LOGIN_URL)
+    try:
+        t0 = time.time()
+        while time.time() - t0 < args.wait:
+            time.sleep(3)
+            cookie = cookies_to_header(browser_cookies())
+            if "ECWEBSESS=" in cookie and _is_logged_in(cookie):
+                return cookie
+        raise Auth(f"no PChome sign-in within {args.wait}s (tab closed; run `pchome login` again)")
+    finally:
+        br.close()
+
+
+def _clipboard():
+    for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-o", "-selection", "clipboard"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
+
+
+def _read_cookie_tty():
+    """Raw tty read: the Linux line editor caps a line at 4095 bytes."""
+    import termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    print("paste the Cookie header, then press Enter (input hidden):", file=sys.stderr)
+    buf = bytearray()
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        while True:
+            ch = os.read(fd, 65536)
+            if not ch:
+                break
+            if b"\x03" in ch:
+                raise KeyboardInterrupt
+            buf += ch
+            if b"\r" in ch or b"\n" in ch:
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        print(file=sys.stderr)
+    return buf.decode("utf-8", "replace").splitlines()[0] if buf else ""
+
+
+def cmd_login(args):
+    if args.from_clipboard:
+        cookie, src = _clipboard(), "clipboard"
+    elif args.cookie_stdin:
+        cookie = (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read()).strip()
+        src = "stdin"
+    else:
+        cookie, src = from_browser(args), f"browser {args.cdp or CDP}"
+    cookie = clean_cookie(cookie)
+    try:
+        u = member_info(cookie, args.debug)
+    except Auth as e:
+        raise Auth(f"that session is not signed in to PChome ({e})")
+    st = load_state()
+    st.pop("source", None)
+    st.update(cookie=cookie, cookie_in_keyring=bool(args.keyring), user=u,
+              logged_in_at=int(time.time()), login_source=src)
+    if args.keyring:
+        _keyring("set", cookie)
+    save_state(st)
+    out = {"user": u, "stored": "keyring" if args.keyring else STATE_FILE, "source": src}
+    return emit(ok(out), args.json,
+                lambda: f"signed in as {u['email'] or u['login_email']} ({u['mobile']}); "
+                        f"session saved to {out['stored']}")
+
+
+def cmd_whoami(args):
+    st = load_state()
+    if not st.get("cookie"):
+        raise Auth("not signed in - run `pchome login`")
+    u = member_info(st["cookie"], args.debug)
+    out = dict(u, source=st.get("source"), verified_over="http",
+               logged_in_at=st.get("logged_in_at"))
+    return emit(ok(out), args.json,
+                lambda: f"{u['email']}  mobile {u['mobile']}  P幣 {u['pcoin']}  購物金 {u['cash_point']}"
+                        f"  (session from {out['source']}, verified over plain HTTP)")
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        _keyring("del")
+    for k in ("cookie", "cookie_in_keyring", "user", "logged_in_at", "login_source", "source"):
+        st.pop(k, None)
+    save_state(st)
+    msg = "local session removed (PChome itself is still signed in in your browser)"
+    if os.environ.get("PCHOME_COOKIE"):
+        msg += "; note PCHOME_COOKIE is still set in the environment"
+    return emit(ok({"logged_out": True}), args.json, msg)
+
+
+# -------------------------------------------------------------------- cart
+def read_cart(c):
+    d = c.get(CARTAPI + "/ItemList?_=%d" % (time.time() * 1000), referer=CART_PAGE)
+    if not isinstance(d, dict) or "itemlist" not in d:
+        raise Auth("cart not readable with the saved session (signed out?) - run `pchome login`",)
+    lines, n = [], 0
+    for house, h in (d["itemlist"].get("houses") or {}).items():
+        for pkg in h.get("packages") or []:
+            for key, it in (pkg.get("items") or {}).items():
+                n += 1
+                lines.append({"line": n, "key": key, "id": it.get("IT_SNO"),
+                              "prod": (it.get("IT_SNO") or "")[:16], "title": it.get("IT_NAME"),
+                              "spec": it.get("SPEC") or "", "qty": it.get("QTY"),
+                              "price": it.get("PRICE"), "subtotal": (it.get("PRICE") or 0) * (it.get("QTY") or 0),
+                              "store": it.get("SR_NO"), "stock": it.get("StockQTY"),
+                              "max_qty": it.get("UNIT"), "type": it.get("TYPE"),
+                              "group": "PChome 快速到貨" if house == "24H" else "廠商出貨",
+                              "error": it.get("Error")})
+    total = sum(x["subtotal"] for x in lines)
+    return {"lines": lines, "count": len(lines), "items_qty": sum(x["qty"] or 0 for x in lines),
+            "total": total, "site_total": d.get("totalPrice")}
+
+
+def cart_table(cart):
+    rows = [[x["line"], x["id"], clip(x["title"], 38), clip(x["spec"], 10), x["qty"], nt(x["price"]),
+             nt(x["subtotal"]), "快速到貨" if x["group"].startswith("PChome") else "廠商"] for x in cart["lines"]]
+    return (table(rows, ["#", "id", "title", "spec", "qty", "price", "subtotal", "ship"]) +
+            f"\n{cart['count']} line(s), {cart['items_qty']} item(s), total {nt(cart['total'])}")
+
+
+def pick_spec(it, want):
+    specs = it["specs"]
+    if not specs:
+        if want:
+            raise Usage(f"{it['id']} has no specs; drop --spec")
+        if not it["in_stock"]:
+            raise ApiError(f"{it['title']} is sold out / not for sale ({it['button']})")
+        return {"id": it["id"] + "-000", "spec": "", "price": it["price"], "qty": it["max_qty"]}
+    if not want:
+        raise Usage(f"{it['id']} needs --spec: " + " / ".join(
+            f"{s['spec']} ({s['id']}{'' if s['buyable'] else ', sold out'})" for s in specs))
+    w = want.strip().lower()
+    hits = ([s for s in specs if s["id"].lower() == w or s["id"][-3:] == w] or
+            [s for s in specs if (s["spec"] or "").lower() == w] or
+            [s for s in specs if w in (s["spec"] or "").lower()])
+    if len(hits) != 1:
+        raise Usage(f"--spec {want!r} matches {len(hits)} specs: " +
+                    " / ".join(f"{s['spec']} ({s['id']})" for s in (hits or specs)))
+    if not hits[0]["buyable"]:
+        raise ApiError(f"spec {hits[0]['spec']} ({hits[0]['id']}) is sold out")
+    return hits[0]
+
+
+def cart_tb(spec_id):
+    # same rule the web app uses: 2nd id segment starting with D = SOFT (downloads), else 24H
+    return "SOFT" if spec_id.split("-")[1][:1] == "D" else "24H"
+
+
+def find_line(cart, ref):
+    ref = ref.strip()
+    if ref.isdigit() and len(ref) < 4:
+        hits = [x for x in cart["lines"] if x["line"] == int(ref)]
+    else:
+        try:
+            pid, suf = prod_id(ref)
+            full = f"{pid}-{suf}" if suf else None
+            hits = [x for x in cart["lines"] if x["id"] == full] if full else \
+                [x for x in cart["lines"] if x["prod"] == pid]
+        except Usage:
+            hits = [x for x in cart["lines"] if x["key"] == ref]
+    if len(hits) != 1:
+        raise Usage(f"{len(hits)} cart lines match {ref!r} (use the line # from `pchome cart list`)",
+                    {"lines": [f"{x['line']}: {x['id']} {x['title']}" for x in cart["lines"]]})
+    return hits[0]
+
+
+def cmd_cart(args):
+    with Client(args, need_login=True) as c:
+        if args.action == "list":
+            cart = read_cart(c)
+            return emit(ok(cart), args.json, lambda: cart_table(cart))
+
+        if args.action == "add":
+            if not args.ref:
+                raise Usage("cart add needs a product id or URL")
+            pid, suf = prod_id(args.ref)
+            it = product_info(c, pid)
+            sp = pick_spec(it, args.spec or (f"{pid}-{suf}" if suf and suf != "000" else None))
+            if args.qty < 1 or (it["max_qty"] and args.qty > it["max_qty"]):
+                raise Usage(f"--qty must be 1..{it['max_qty']}")
+            plan = {"id": sp["id"], "title": it["title"], "spec": sp.get("spec") or "", "qty": args.qty,
+                    "price": sp.get("price") or it["price"],
+                    "total": (sp.get("price") or it["price"] or 0) * args.qty, "url": it["url"]}
+            desc = (f"{args.qty}x {it['title']}" + (f" [{plan['spec']}]" if plan["spec"] else "") +
+                    f"  {nt(plan['price'])} = {nt(plan['total'])}")
+            if not args.yes:
+                return emit(ok(dict(plan, dry_run=True)), args.json,
+                            f"would add to cart: {desc}\nre-run with --yes")
+            before = read_cart(c)
+            had = next((x["qty"] for x in before["lines"] if x["id"] == sp["id"]), 0)
+            mac = c.get(f"{CARTJS}/sys/cflow/ecapi/prod/cart/v1/prod/{pid}/snapup?_=%d" % time.time()) or {}
+            if mac.get("Status") != "OK":
+                raise ApiError("PChome refused the add-to-cart token (snapup)", {"reply": mac})
+            data = {"G": [], "A": [], "B": [], "C": [], "TB": cart_tb(sp["id"]), "TP": 2, "T": "ADD",
+                    "TI": sp["id"], "RS": it["store"], "YTQ": args.qty,
+                    "CAX": mac.get("MAC"), "CAXE": mac.get("MACExpire")}
+            r = c.get(f"{CARTJS}/cart/index.php/prod/modify?callback=jsonp_addcart&%d&data=%s"
+                      % (time.time(), urllib.parse.quote(json.dumps(data, separators=(",", ":"), ensure_ascii=False))))
+            if isinstance(r, dict) and r.get("OverQtyMsg"):
+                raise ApiError(f"PChome: {r['OverQtyMsg']}", {"reply": r})
+            time.sleep(0.5)
+            after = read_cart(c)
+            line = next((x for x in after["lines"] if x["id"] == sp["id"]), None)
+            if not line or line["qty"] <= had:
+                raise ApiError("PChome answered the add but the cart did not change",
+                               {"reply": r, "qty_before": had})
+            return emit(ok({"added": plan, "verified_line": line, "qty_before": had,
+                            "cart_count": after["count"], "cart_total": after["total"]}), args.json,
+                        f"added: {desc}\nverified in cart: line {line['line']} {line['id']} qty {had} -> {line['qty']}"
+                        f"  (cart now {after['count']} line(s), {nt(after['total'])})")
+
+        cart = read_cart(c)
+        if not args.ref:
+            raise Usage(f"cart {args.action} needs a line # / product id")
+        ln = find_line(cart, args.ref)
+        if args.action == "qty":
+            if args.n is None or args.n < 1:
+                raise Usage("cart qty <line> N needs N >= 1 (use `cart rm` to remove)")
+            if ln["max_qty"] and args.n > ln["max_qty"]:
+                raise Usage(f"max {ln['max_qty']} for this item")
+            data = {"T": "UPD", "TI": ln["id"], "YTQ": args.n, "RS": ln["store"], "TB": cart_tb(ln["id"]),
+                    "KEY": ln["key"], "LB": "Y"}
+            what = f"set qty of line {ln['line']} {ln['title']} from {ln['qty']} to {args.n}"
+        else:
+            data = {"T": "DEL", "TI": ln["id"], "RS": ln["store"], "TTI": "A", "KEY": ln["key"], "LB": "Y"}
+            what = f"remove line {ln['line']}: {ln['qty']}x {ln['title']} ({ln['id']})"
+        if not args.yes:
+            return emit(ok({"dry_run": True, "line": ln, "op": data["T"]}), args.json,
+                        f"would {what}\nre-run with --yes")
+        c.post(CARTAPI + "/modifyItem?_=%d" % (time.time() * 1000),
+               {"data": json.dumps(data, separators=(",", ":"), ensure_ascii=False)})
+        time.sleep(0.5)
+        after = read_cart(c)
+        now = next((x for x in after["lines"] if x["key"] == ln["key"]), None) or \
+            next((x for x in after["lines"] if x["id"] == ln["id"]), None)
+        if args.action == "rm":
+            if now:
+                raise ApiError("PChome answered the remove but the line is still in the cart", {"line": now})
+            return emit(ok({"removed": ln, "verified": True, "cart_count": after["count"],
+                            "cart_total": after["total"]}), args.json,
+                        f"removed {ln['id']} {ln['title']}; verified gone "
+                        f"(cart now {after['count']} line(s), {nt(after['total'])})")
+        if not now or now["qty"] != args.n:
+            raise ApiError("PChome answered the update but the cart shows a different qty",
+                           {"line": now, "wanted": args.n})
+        return emit(ok({"updated": now, "qty_before": ln["qty"], "verified": True,
+                        "cart_total": after["total"]}), args.json,
+                    f"line {now['line']} {now['title']}: qty {ln['qty']} -> {now['qty']} (verified); "
+                    f"cart total {nt(after['total'])}")
+
+
+# ------------------------------------------------------------------ doctor
+def cmd_doctor(args):
+    checks = []
+    st = load_state()
+    checks.append(["state", "ok" if os.path.exists(STATE_FILE) else "-", STATE_FILE])
+    h = Http(None, args.debug)
+    try:
+        d = parse_json(SEARCH, *h.request(SEARCH + "?" + urllib.parse.urlencode({"q": "衛生紙", "page": 1})))
+        checks.append(["search", "ok", f"ecshweb search over HTTP ({d.get('TotalRows')} hits for 衛生紙)"])
+    except (Net, ApiError) as e:
+        checks.append(["search", "FAIL", str(e)])
+    try:
+        d = parse_json(PROD, *h.request(f"{PROD}/prod/DAAG8M-A900H3TL3&fields=Id,Name&_callback=cb"))
+        if not d:
+            raise ApiError("prodapi returned an empty reply")
+        checks.append(["product", "ok", "ecapi-cdn prodapi over HTTP"])
+    except (Net, ApiError) as e:
+        checks.append(["product", "FAIL", str(e)])
+    try:
+        ver = _cdp_json("/json/version")
+        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')} (fallback + login --from-browser)"])
+    except Net:
+        checks.append(["cdp", "-", f"no browser on {CDP} (only for fallback / login --from-browser)"])
+    if st.get("cookie"):
+        try:
+            u = member_info(st["cookie"], args.debug)
+            checks.append(["login", "ok", f"{u['email']} via {st.get('source')} (verified over HTTP)"])
+            cart = read_cart(Client(args, need_login=True))
+            checks.append(["cart", "ok", f"{cart['count']} line(s), {nt(cart['total'])}"])
+        except (Auth, ApiError, Net) as e:
+            checks.append(["login", "FAIL", f"saved session rejected: {e}"])
+    else:
+        checks.append(["login", "-", "not signed in (search/product/price work; cart needs `pchome login`)"])
+    bad = any(c[1] == "FAIL" for c in checks)
+    payload = err("doctor found problems", EX_NET, checks=checks) if bad else ok({"checks": checks})
+    if bad and not args.json:
+        print(table(checks, ["check", "state", "detail"]))
+    return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
+
+
+# ------------------------------------------------------------------ parser
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        emit(err(f"{self.prog}: {message}", EX_USAGE), as_json)
+        if not as_json:
+            self.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def build_parser():
+    p = Parser(prog="pchome", description="PChome 24h購物 from the shell (no checkout).")
+    p.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="stable {ok, data|error} envelope")
+    common.add_argument("--debug", action="store_true", help="dump HTTP calls to stderr")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="reads: direct HTTP, CDP background tab, or HTTP with browser fallback")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    sub.add_parser("doctor", parents=[common], help="API reachability, browser, login + cart state"
+                   ).set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("search", parents=[common], help="search products")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--sort", choices=list(SORTS), default="relevance")
+    s.add_argument("--min", type=int, help="min price TWD")
+    s.add_argument("--max", type=int, help="max price TWD")
+    s.add_argument("--page", type=int, default=1)
+    s.set_defaults(fn=cmd_search)
+
+    pr = sub.add_parser("product", aliases=["item"], parents=[common],
+                        help="one product: price, stock, shipping, specs")
+    pr.add_argument("ref", help="product URL or id (DAAG8M-A900H3TL3)")
+    pr.set_defaults(fn=cmd_product)
+
+    pc = sub.add_parser("price", parents=[common], help="quick price/stock check for many ids")
+    pc.add_argument("refs", nargs="+", help="product URLs or ids")
+    pc.set_defaults(fn=cmd_price)
+
+    r = sub.add_parser("raw", parents=[common], help="GET a read-only PChome JSON endpoint")
+    r.add_argument("url", help="full URL, or a path under ecapi-cdn .../prodapi/v2/")
+    r.set_defaults(fn=cmd_raw)
+
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in PChome session")
+    g = lg.add_mutually_exclusive_group()
+    g.add_argument("--from-browser", action="store_true",
+                   help="(default) copy the session from the CDP browser; opens the login page "
+                        "in a background tab and waits if it is not signed in")
+    g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
+    g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a DevTools Cookie header")
+    lg.add_argument("--cdp", help=f"CDP endpoint (default {CDP})")
+    lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in (default 300)")
+    lg.add_argument("--keyring", action="store_true", help="store the cookie in the OS keyring")
+    lg.set_defaults(fn=cmd_login)
+    sub.add_parser("whoami", parents=[common], help="verify the saved session over HTTP"
+                   ).set_defaults(fn=cmd_whoami)
+    sub.add_parser("logout", parents=[common], help="forget the saved session"
+                   ).set_defaults(fn=cmd_logout)
+
+    ct = sub.add_parser("cart", parents=[common], help="購物車: list / add / rm / qty (no checkout)")
+    ct.add_argument("action", choices=["list", "add", "rm", "qty"])
+    ct.add_argument("ref", nargs="?", help="add: product id/URL; rm/qty: line # or product id")
+    ct.add_argument("n", nargs="?", type=int, help="qty: new quantity")
+    ct.add_argument("--qty", type=int, default=1, help="add: quantity (default 1)")
+    ct.add_argument("--spec", "--opt", dest="spec", help="add: spec text (e.g. 38) or spec id (…-004)")
+    ct.add_argument("--yes", action="store_true", help="really change the cart (else dry run)")
+    ct.set_defaults(fn=cmd_cart)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE, **(e.detail or {})), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
