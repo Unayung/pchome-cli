@@ -6,7 +6,7 @@ description: Use when searching PChome 24h購物 (24h.pchome.com.tw) products, c
 # pchome — PChome 24h購物 from a shell (no checkout)
 
 `~/.local/bin/pchome` → `~/Projects/pchome-cli/pchome`. Stdlib Python, plain HTTPS; Edge on
-CDP 9222 is only a fallback and the source for `pchome login`. Run `pchome doctor` first.
+CDP 9222 is only a read fallback and the opt-in `pchome login --from-browser`. Run `pchome doctor` first.
 
 Read (no login):
 - `pchome search <q> --json [--limit N] [--sort relevance|sales|price|price-desc|new] [--min/--max TWD]`
@@ -16,11 +16,13 @@ Read (no login):
 - `pchome price <id> <id> … --json` → batch price/stock for monitoring
 - Product ids look like `DAAG8M-A900H3TL3`; URLs `24h.pchome.com.tw/prod/<id>` work too.
 
-Login (never ask for or type passwords/OTP):
-- `pchome login` copies the session from Edge; if Edge is not signed in it opens the login page
-  in a background tab and waits up to `--wait 300`s while the USER signs in. Tell them to do so.
+Login (never ask for or type passwords/OTP, and never ask the user to paste cookies into chat):
+- Tell the user: DevTools > Network > click any 24h.pchome.com.tw request > copy the `Cookie:`
+  request header to the clipboard, then run `pchome login` themselves (or pipe it in on stdin).
+  No usable Cookie header = exit 2 with those steps.
 - `pchome whoami` proves the saved session over HTTP; exit 3 = not signed in → `pchome login`.
-- Fallbacks: `login --from-clipboard` / `--cookie-stdin` (DevTools Cookie header; never pasted in chat).
+- `login --from-browser` is opt-in only (Edge on CDP 9222; waits up to `--wait 300`s for the USER
+  to sign in in a background tab). `--from-clipboard` / `--cookie-stdin` also work.
 
 Cart (writes need explicit user approval):
 1. `pchome cart list --json` — lines with `line`, `id`, `qty`, `price`, `subtotal`, `total`

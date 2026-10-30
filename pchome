@@ -46,11 +46,13 @@ works for all of them; none was bot-walled):
   never called.
 
 Login: PChome uses password + reCAPTCHA (+ OTP), so the CLI never handles
-credentials. `pchome login` (default --from-browser) reads the pchome cookies
-from the Edge/Chrome on CDP (PCHOME_CDP, default http://127.0.0.1:9222); if
-that browser is not signed in it opens the login page in a BACKGROUND tab and
-polls until you sign in there yourself (--wait, default 300 s), then closes
-only that tab. Also --from-clipboard / --cookie-stdin. The cookie is verified
+credentials. `pchome login` takes a DevTools `Cookie:` request header: from
+stdin when piped, else from the clipboard (exit 2 + instructions if the
+clipboard holds no PChome Cookie header). Also --from-clipboard / --cookie-stdin.
+`pchome login --from-browser` (opt-in) reads the cookies from the Edge/Chrome
+on CDP (PCHOME_CDP, default http://127.0.0.1:9222); if that browser is not
+signed in it opens the login page in a BACKGROUND tab and polls until you sign
+in there yourself (--wait, default 300 s), then closes only that tab. The cookie is verified
 over plain HTTP (member/islogin + member/id) before it is saved to
 ~/.config/pchome/state.json (0600) or the OS keyring (--keyring).
 PCHOME_COOKIE overrides both. Cart commands always use the SAVED session.
@@ -833,14 +835,36 @@ def _read_cookie_tty():
     return buf.decode("utf-8", "replace").splitlines()[0] if buf else ""
 
 
+LOGIN_HOWTO = ("no PChome Cookie header found. In the browser: DevTools > Network > click any "
+               "request to 24h.pchome.com.tw > Request Headers > copy the `Cookie:` value, "
+               "then run `pchome login` again (or pipe it in)")
+
+
+def _default_cookie():
+    """No source flag: piped stdin, else the clipboard. Exit 2 with the howto if it is no cookie."""
+    if sys.stdin.isatty():
+        try:
+            raw, src = _clipboard(), "clipboard"
+        except Auth:
+            raw, src = "", "clipboard"
+    else:
+        raw, src = sys.stdin.read(), "stdin"
+    try:
+        return clean_cookie(raw), src
+    except Auth:
+        raise Usage(LOGIN_HOWTO)
+
+
 def cmd_login(args):
     if args.from_clipboard:
         cookie, src = _clipboard(), "clipboard"
     elif args.cookie_stdin:
         cookie = (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read()).strip()
         src = "stdin"
-    else:
+    elif args.from_browser:
         cookie, src = from_browser(args), f"browser {args.cdp or CDP}"
+    else:
+        cookie, src = _default_cookie()
     cookie = clean_cookie(cookie)
     try:
         u = member_info(cookie, args.debug)
@@ -1130,10 +1154,10 @@ def build_parser():
     r.add_argument("url", help="full URL, or a path under ecapi-cdn .../prodapi/v2/")
     r.set_defaults(fn=cmd_raw)
 
-    lg = sub.add_parser("login", parents=[common], help="save a signed-in PChome session")
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in PChome session (default: Cookie header from stdin or clipboard)")
     g = lg.add_mutually_exclusive_group()
     g.add_argument("--from-browser", action="store_true",
-                   help="(default) copy the session from the CDP browser; opens the login page "
+                   help="(opt-in) copy the session from the CDP browser; opens the login page "
                         "in a background tab and waits if it is not signed in")
     g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
     g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a DevTools Cookie header")

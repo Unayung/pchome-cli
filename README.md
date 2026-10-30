@@ -19,21 +19,32 @@ pchome raw 'prod/button&id=DAAG8M-A900H3TL3&fields=Id,Price'   # read-only GET p
 
 ## Login (no password)
 
-PChome signs in with password + reCAPTCHA (+ OTP), so the CLI never takes credentials.
+PChome signs in with password + reCAPTCHA (+ OTP), so the CLI never takes credentials. It logs in
+with the `Cookie` request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `24h.pchome.com.tw` > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `).
+3. Run `pchome login`. It reads the clipboard, or stdin when piped.
 
 ```
-pchome login                    # = --from-browser: copy the session from Edge on CDP 9222.
-                                #   Not signed in there? opens the login page in a background tab
-                                #   and waits (--wait 300) until you sign in yourself
-pchome login --from-clipboard   # copy DevTools' "Cookie" request header first
-pchome login --cookie-stdin     # or paste / pipe it
-pchome whoami                   # verifies the SAVED session over plain HTTP (email, mobile, P幣)
+pchome login                     # Cookie header from stdin (piped) or the clipboard;
+                                 #   nothing usable there = exit 2 with these steps
+pchome login --from-clipboard    # clipboard only
+pchome login --cookie-stdin      # paste (hidden, raw tty) or pipe it
+pchome login --keyring           # store it in the OS keyring instead of the file
+pchome login --from-browser      # opt-in: copy the session from Edge on CDP 9222; if not signed
+                                 #   in, opens the login page in a background tab (--wait 300)
+pchome whoami                    # verifies the SAVED session over plain HTTP (email, mobile, P幣)
 pchome logout
 ```
 
 The session (the `ECWEBSESS` cookie is the one that matters) is verified with
 `member/v2/member/islogin` + `member/id` before saving to `~/.config/pchome/state.json` (0600,
 `PCHOME_HOME` moves it) or the OS keyring with `--keyring`. `PCHOME_COOKIE` overrides both.
+Exit 3 means there is no valid session (or it expired): log in again.
+
+Edge on CDP 9222 is needed only for `login --from-browser` and as the fallback when a read gets a
+403/HTML challenge.
 
 ## Cart (購物車)
 
