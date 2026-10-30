@@ -35,3 +35,5 @@ Pitfalls:
 - Signing in merges any guest cart into the member cart, so items added while logged out show up.
 - Specs: `cart add` without `--spec` on a spec product exits 2 and lists the choices.
 - No checkout/payment endpoints exist in the CLI by design; never try to place orders.
+
+CDP setup: if `pchome doctor` shows `cdp` failing and a command needs Edge, ask the user to start it as in README "Browser on CDP 9222" (separate `--user-data-dir`, `--remote-debugging-port=9222`). Never launch a browser yourself.
